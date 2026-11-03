@@ -28,6 +28,7 @@ import { addStage, deleteStage, moveToStage, renameStage } from "../lifecycle/st
 import { FileChange } from "../lifecycle/edit";
 import { CellChange, checkCell, lifecycleTable, planChanges, statesTable, suggestCell, TableContext, TableModel, TableTab, transfersTable } from "../lifecycle/table";
 import { Grid } from "./grid";
+import { bindSplitter } from "./splitter";
 import { attachSuggestions } from "./suggest";
 import css from "./studio.css";
 import redHatDisplay from "@fontsource-variable/red-hat-display/files/red-hat-display-latin-wght-normal.woff2";
@@ -172,36 +173,12 @@ function applyWidths(): void {
     }
 }
 
-/** Resize a side panel by dragging its edge */
-function bindSplitter(splitter: HTMLElement, side: "leftWidth" | "rightWidth"): void {
-    let dragging = false;
-    splitter.addEventListener("pointerdown", (e) => {
-        dragging = true;
-        splitter.setPointerCapture(e.pointerId);
-        splitter.classList.add("active");
-    });
-    splitter.addEventListener("pointermove", (e) => {
-        if (!dragging) {
-            return;
-        }
-        const rect = main.getBoundingClientRect();
-        const width = side === "leftWidth" ? e.clientX - rect.left : rect.right - e.clientX;
-        ui[side] = Math.round(Math.min(Math.max(width, 160), rect.width * 0.6));
+for (const [splitter, side] of [[leftSplit, "leftWidth"], [rightSplit, "rightWidth"]] as const) {
+    bindSplitter(splitter, main, side === "leftWidth" ? "left" : "right", (width) => {
+        ui[side] = width;
         applyWidths();
-    });
-    splitter.addEventListener("pointerup", () => {
-        dragging = false;
-        splitter.classList.remove("active");
-        persist();
-    });
-    splitter.addEventListener("dblclick", () => {
-        ui[side] = undefined;
-        applyWidths();
-        persist();
-    });
+    }, persist);
 }
-bindSplitter(leftSplit, "leftWidth");
-bindSplitter(rightSplit, "rightWidth");
 applyWidths();
 
 const zoomControls = h("div", { class: "zoom" },

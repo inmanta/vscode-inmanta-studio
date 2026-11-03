@@ -1,0 +1,67 @@
+/* The Onboarding Studio, on top of studio.css of the Lifecycle Studio */
+#app.onboarding { --left: var(--left-w, 300px); --right: var(--right-w, 340px); }
+.onboarding .content { background: var(--vscode-editor-background); }
+.onboarding .problems[hidden] { display: none; }
+.onboarding .problems pre { margin: 4px 0; white-space: pre-wrap; }
+.onboarding h2 { font-size: 1.15em; margin: 0; }
+.onboarding .title { margin-bottom: 8px; }
+
+/* command buttons: the title and the command they run */
+button.cmd { display: grid; gap: 2px; text-align: left; padding: 5px 9px; width: 100%; }
+button.cmd b { font-weight: 600; }
+button.cmd code { color: var(--muted); font-size: 0.85em; overflow-wrap: anywhere; }
+button.cmd .why { color: var(--vscode-editorWarning-foreground); font-size: 0.85em; }
+button.cmd:disabled { opacity: 0.7; }
+button.cmd:disabled b, button.cmd:disabled code { opacity: 0.6; }
+.actions.column { display: grid; gap: 6px; }
+.inspector .field { margin-top: 8px; }
+
+/* tables */
+.table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+.table th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border); padding: 3px 8px 3px 0; }
+.table td { border-bottom: 1px solid var(--border); padding: 3px 8px 3px 0; vertical-align: top; overflow-wrap: anywhere; }
+.table .num { text-align: right; }
+.table.status th, .table.status td { padding-right: 6px; }
+.table.attributes td:first-child { white-space: nowrap; color: var(--muted); width: 1%; }
+.table.attributes tr.set td:first-child { color: var(--vscode-foreground); font-weight: 600; }
+.table.attributes pre { margin: 4px 0; white-space: pre-wrap; max-height: 300px; overflow: auto; }
+.table.attributes td:last-child { white-space: nowrap; width: 1%; color: var(--k-deployed); }
+
+/* candidate list */
+.onboarding .left select.entity { width: 100%; margin-bottom: 6px; }
+.stage-chips { margin-bottom: 6px; }
+.chip.on { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+button.chip { cursor: pointer; }
+.candidate-list { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 1px; }
+.candidate-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px; align-items: center; padding: 3px 4px; border-radius: 3px; cursor: pointer; }
+.candidate-list li:hover { background: var(--vscode-list-hoverBackground); }
+.candidate-list li.on { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+.candidate-list .who { display: grid; min-width: 0; }
+.candidate-list .who > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.candidate-list .badge { font-size: 0.8em; }
+
+/* findings */
+.findings { display: grid; gap: 6px; }
+.finding { display: grid; grid-template-columns: 84px minmax(90px, auto) minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.finding .badge { text-align: center; }
+.finding:not(.open) { opacity: 0.75; }
+.finding .resolved-how { color: var(--k-deployed); }
+.set-form { grid-column: 2 / -1; display: grid; gap: 3px; }
+.set-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px; }
+.set-form code { color: var(--muted); overflow-wrap: anywhere; }
+
+/* changes */
+.changes { display: grid; gap: 4px; }
+.change { display: grid; grid-template-columns: auto 104px minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.change .badge { text-align: center; }
+.change .pick { display: inline-flex; gap: 4px; align-items: center; }
+.change .what { min-width: 0; overflow-wrap: anywhere; }
+.change del { color: var(--k-failed); text-decoration: line-through; }
+.change ins { color: var(--k-deployed); text-decoration: none; }
+details summary { cursor: pointer; }
+
+/* pipeline: one column, the status first */
+#app[data-view="pipeline"] .main { grid-template-columns: minmax(0, 1fr); }
+#app[data-view="pipeline"] .inspector, #app[data-view="pipeline"] .right-split { display: none; }
+.content .actions:not(.column) button.cmd { width: auto; min-width: 260px; }
+.content .table { max-width: 1100px; }
