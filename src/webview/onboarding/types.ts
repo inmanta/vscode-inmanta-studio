@@ -28,12 +28,13 @@ export interface Candidate {
     folder: string;
     stage: string;
     outcome: "blocked" | "review" | "ready";
+    gone: boolean;
     review: { status: "open" | "accepted" | "rejected"; set: Record<string, unknown>; accepted_conflicts: string[]; reason: string };
     sources: string[];
     attributes: Record<string, unknown>;
     findings: Finding[];
     files: string[];
-    result: { state: string; version: number; read_at: string; id: string; deleted: boolean; resources: Record<string, string> | null } | null;
+    result: { state: string; version: number; read_at: string; id: string; deleted: boolean; gone_at?: string | null; resources: Record<string, string> | null; error?: InstanceError | null } | null;
     changes: Change[] | null;
     worst: string | null;
     decisions: Record<string, unknown>[];
@@ -47,5 +48,20 @@ export interface Snapshot {
     observations: { type: string; source: string | null; count: number | null }[];
     rules: string[];
     candidates: Candidate[];
+    /** per entity, and per embedded entity as `Entity.embedded`: the type of each attribute in lsm notation */
+    catalog: Record<string, Record<string, CatalogAttribute>>;
     errors: string[];
+}
+
+export interface CatalogAttribute {
+    type: string;
+    values: string[] | null;
+    required: boolean;
+}
+
+/** Why lsm took an error transition into the current version */
+export interface InstanceError {
+    transition: string;
+    compile_report: string | null;
+    compile_error: string | null;
 }

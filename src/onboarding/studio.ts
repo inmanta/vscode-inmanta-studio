@@ -13,6 +13,7 @@ import {
     ExtensionContext,
     RelativePattern,
     Terminal,
+    TerminalShellIntegration,
     TextDocument,
     Uri,
     ViewColumn,
@@ -74,6 +75,23 @@ function findEngine(workspaceDir: string): Engine | null {
 
 function quote(arg: string): string {
     return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/** The shell integration of a new terminal once its shell is ready, undefined when it does not come in time */
+function shellIntegration(terminal: Terminal, timeout: number): Promise<TerminalShellIntegration | undefined> {
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            listener.dispose();
+            resolve(undefined);
+        }, timeout);
+        const listener = window.onDidChangeTerminalShellIntegration((e) => {
+            if (e.terminal === terminal) {
+                clearTimeout(timer);
+                listener.dispose();
+                resolve(e.shellIntegration);
+            }
+        });
+    });
 }
 
 function debounce(f: () => void, ms: number): () => void {
@@ -161,7 +179,7 @@ class OnboardingStudioProvider implements CustomTextEditorProvider {
                 await load();
                 return;
             case "run":
-                this.run(workspaceDir, message.args);
+                await this.run(workspaceDir, message.args);
                 return;
             case "open": {
                 const uri = Uri.file(path.join(workspaceDir, message.path));
@@ -172,13 +190,14 @@ class OnboardingStudioProvider implements CustomTextEditorProvider {
     }
 
     /** Type the command in the terminal of the workspace: the user sees it, its output and can rerun it */
-    private run(workspaceDir: string, args: string[]): void {
+    private async run(workspaceDir: string, args: string[]): Promise<void> {
         const engine = findEngine(workspaceDir);
         if (engine === null) {
             void window.showErrorMessage("Onboarding Studio: no python with the onboarding engine, set inmanta.onboarding.python");
             return;
         }
         let terminal = this.terminals.get(workspaceDir);
+        const fresh = terminal === undefined;
         if (terminal === undefined) {
             const editor = workspace.getConfiguration("inmanta.onboarding").get<string>("editor");
             terminal = window.createTerminal({
@@ -190,7 +209,14 @@ class OnboardingStudioProvider implements CustomTextEditorProvider {
             this.terminals.set(workspaceDir, terminal);
         }
         terminal.show(true);
-        terminal.sendText([engine.python, ...engine.prefix, ...args].map(quote).join(" "));
+        const text = [engine.python, ...engine.prefix, ...args].map(quote).join(" ");
+        // text sent while a new shell still starts is lost, e.g. when the python extension activates a venv in it
+        const integration = terminal.shellIntegration ?? (fresh ? await shellIntegration(terminal, 5000) : undefined);
+        if (integration) {
+            integration.executeCommand(text);
+        } else {
+            terminal.sendText(text);
+        }
     }
 
     private html(script: string, cspSource: string): string {
