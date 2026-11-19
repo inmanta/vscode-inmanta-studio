@@ -1,0 +1,23 @@
+{
+    "compilerOptions": {
+        "module": "commonjs",
+        "target": "es2020",
+        "skipLibCheck": true,
+        "outDir": "out",
+        "esModuleInterop": true,
+        "lib": [
+            "es2020"
+        ],
+        "sourceMap": true,
+        "rootDir": "src",
+        "types": [
+            "node",
+            "mocha"
+        ]
+    },
+    "exclude": [
+        "node_modules",
+        ".vscode-test",
+        "src/webview"
+    ]
+}
