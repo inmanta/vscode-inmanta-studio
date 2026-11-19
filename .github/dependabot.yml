@@ -11,3 +11,6 @@ updates:
   ignore:
     - dependency-name: "@types/vscode"
       update-types: ["version-update:semver-minor"]
+    # Follow the Node.js that the supported VS Code versions ship
+    - dependency-name: "@types/node"
+      update-types: ["version-update:semver-major"]
