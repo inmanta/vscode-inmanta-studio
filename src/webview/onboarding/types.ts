@@ -65,3 +65,22 @@ export interface InstanceError {
     compile_report: string | null;
     compile_error: string | null;
 }
+
+/** A background step of `onboard serve` */
+export interface Step {
+    name: string;
+    command: string;
+    state: "fresh" | "stale" | "running" | "failed" | "never";
+    error: string | null;
+    last_run: string | null;
+    next_run: string | null;
+}
+
+/** A command the engine ran: an action of the user or a background step */
+export interface Activity {
+    at: string;
+    kind: "action" | "step";
+    command: string;
+    ok: boolean;
+    output: string;
+}

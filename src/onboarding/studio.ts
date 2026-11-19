@@ -1,19 +1,18 @@
 /**
- * The Onboarding Studio: a custom editor on the `onboard.yaml` of an onboarding workspace.  It renders what
- * `onboard status --json` prints and runs every action as an `onboard` command in a terminal, so nothing
- * happens that the user could not type.
+ * The Onboarding Studio: a custom editor on the `onboard.yaml` of an onboarding workspace.  It talks to `onboard serve`,
+ * the engine that keeps the workspace up to date and pushes what changed.  Every action is an `onboard` command as the
+ * CLI takes it, so nothing happens that the user could not type; the activity shows each one.
  */
-import { execFile } from "child_process";
+import { ChildProcess, spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import * as readline from "readline";
 import {
     commands,
     CustomTextEditorProvider,
-    Disposable,
     ExtensionContext,
-    RelativePattern,
-    Terminal,
-    TerminalShellIntegration,
+    OutputChannel,
+    TabInputText,
     TextDocument,
     Uri,
     ViewColumn,
@@ -29,7 +28,11 @@ export type WebviewMessage =
     | { type: "ready" }
     | { type: "refresh" }
     | { type: "run"; args: string[] }
+    | { type: "step"; step: string }
     | { type: "open"; path: string };
+
+/** The commands with a draft to edit: the draft opens in an editor tab, saving it passes it back with `--from` */
+const EDITOR_COMMANDS = [["review", "edit"], ["rules", "diff"]];
 
 /** How to run `onboard` for a workspace: the python, the directory to run in and the command as typed there */
 interface Engine {
@@ -77,42 +80,142 @@ function quote(arg: string): string {
     return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
-/** The shell integration of a new terminal once its shell is ready, undefined when it does not come in time */
-function shellIntegration(terminal: Terminal, timeout: number): Promise<TerminalShellIntegration | undefined> {
-    return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-            listener.dispose();
-            resolve(undefined);
-        }, timeout);
-        const listener = window.onDidChangeTerminalShellIntegration((e) => {
-            if (e.terminal === terminal) {
-                clearTimeout(timer);
-                listener.dispose();
-                resolve(e.shellIntegration);
-            }
-        });
-    });
+/** A message of `onboard serve`: an event, or the reply to a request */
+interface EngineMessage {
+    event?: "snapshot" | "steps" | "activity" | "error";
+    data?: unknown;
+    id?: number;
+    result?: { ok: boolean; output: string; command?: string };
+    error?: string;
 }
 
-function debounce(f: () => void, ms: number): () => void {
-    let timer: NodeJS.Timeout | undefined;
-    return () => {
-        clearTimeout(timer);
-        timer = setTimeout(f, ms);
-    };
+/**
+ * The `onboard serve` of one workspace, shared by its panels.  It restarts when it stops, unless it keeps stopping
+ * right after it started: then the panels show why.
+ */
+class EngineProcess {
+    private process: ChildProcess | null = null;
+    private nextId = 1;
+    private readonly pending = new Map<number, (message: EngineMessage) => void>();
+    private readonly listeners = new Set<(message: EngineMessage | { event: "stopped"; data: string }) => void>();
+    private quickExits = 0;
+    private stderr: string[] = [];
+    private disposed = false;
+    /** The last snapshot and steps: a panel that opens later gets them right away */
+    private readonly last = new Map<string, EngineMessage>();
+
+    constructor(private readonly workspaceDir: string, private readonly output: OutputChannel) {}
+
+    listen(listener: (message: EngineMessage | { event: "stopped"; data: string }) => void): () => void {
+        this.listeners.add(listener);
+        this.last.forEach((m) => listener(m));
+        this.start();
+        return () => {
+            this.listeners.delete(listener);
+            if (this.listeners.size === 0) {
+                this.stop();
+            }
+        };
+    }
+
+    private broadcast(message: EngineMessage | { event: "stopped"; data: string }): void {
+        this.listeners.forEach((l) => l(message));
+    }
+
+    private start(): void {
+        if (this.process || this.disposed) {
+            return;
+        }
+        const engine = findEngine(this.workspaceDir);
+        if (engine === null) {
+            this.broadcast({ event: "stopped", data: `No .venv with the onboarding engine above ${this.workspaceDir}. Set inmanta.onboarding.python to the python that has it.` });
+            return;
+        }
+        const started = Date.now();
+        const child = spawn(engine.python, [...engine.prefix, "serve"], { cwd: engine.cwd, stdio: ["pipe", "pipe", "pipe"] });
+        this.process = child;
+        this.stderr = [];
+        this.output.appendLine(`started: ${[engine.python, ...engine.prefix, "serve"].map(quote).join(" ")} in ${engine.cwd}`);
+        readline.createInterface({ input: child.stdout! }).on("line", (line) => this.receive(line));
+        readline.createInterface({ input: child.stderr! }).on("line", (line) => {
+            this.output.appendLine(line);
+            this.stderr = [...this.stderr.slice(-40), line];
+        });
+        child.on("error", (e) => this.output.appendLine(`engine: ${e.message}`));
+        child.on("exit", (code) => {
+            this.process = null;
+            this.pending.forEach((resolve) => resolve({ result: { ok: false, output: "the engine stopped" } }));
+            this.pending.clear();
+            if (this.disposed || this.listeners.size === 0) {
+                return;
+            }
+            this.quickExits = Date.now() - started < 10_000 ? this.quickExits + 1 : 0;
+            const why = `onboard serve stopped (exit ${code}):\n${this.stderr.slice(-15).join("\n")}`;
+            this.broadcast({ event: "stopped", data: this.quickExits >= 3 ? `${why}\n\nNot restarted: it stopped ${this.quickExits} times right after it started. Refresh to try again.` : why });
+            if (this.quickExits < 3) {
+                setTimeout(() => this.start(), 2000);
+            }
+        });
+    }
+
+    private stop(): void {
+        this.process?.stdin?.end();
+        this.process = null;
+    }
+
+    dispose(): void {
+        this.disposed = true;
+        this.stop();
+    }
+
+    /** Start it again after it gave up, e.g. once the python or the workspace is fixed */
+    restart(): void {
+        this.quickExits = 0;
+        this.start();
+    }
+
+    private receive(line: string): void {
+        let message: EngineMessage;
+        try {
+            message = JSON.parse(line) as EngineMessage;
+        } catch (_e) {
+            this.output.appendLine(`not json: ${line}`);
+            return;
+        }
+        if (message.id !== undefined) {
+            this.pending.get(message.id)?.(message);
+            this.pending.delete(message.id);
+            return;
+        }
+        if (message.event === "snapshot" || message.event === "steps") {
+            this.last.set(message.event, message);
+        }
+        this.broadcast(message);
+    }
+
+    request(method: string, params: object): Promise<EngineMessage> {
+        this.start();
+        const child = this.process;
+        if (!child?.stdin) {
+            return Promise.resolve({ error: "the engine is not running" });
+        }
+        const id = this.nextId++;
+        return new Promise((resolve) => {
+            this.pending.set(id, resolve);
+            child.stdin!.write(JSON.stringify({ id, method, params }) + "\n");
+        });
+    }
 }
 
 class OnboardingStudioProvider implements CustomTextEditorProvider {
-    private readonly terminals = new Map<string, Terminal>();
+    /** The open drafts by file: what to stop when the draft is taken or its tab closes */
+    private readonly drafts = new Map<string, () => void>();
+    private readonly engines = new Map<string, EngineProcess>();
+    private readonly output = window.createOutputChannel("Inmanta Onboarding");
 
     constructor(private readonly context: ExtensionContext) {
-        context.subscriptions.push(window.onDidCloseTerminal((t) => {
-            for (const [key, terminal] of this.terminals) {
-                if (terminal === t) {
-                    this.terminals.delete(key);
-                }
-            }
-        }));
+        context.subscriptions.push(this.output, { dispose: () => this.engines.forEach((e) => e.dispose()) });
+        context.subscriptions.push({ dispose: () => [...this.drafts.values()].forEach((stop) => stop()) });
     }
 
     async resolveCustomTextEditor(document: TextDocument, panel: WebviewPanel): Promise<void> {
@@ -122,65 +225,65 @@ class OnboardingStudioProvider implements CustomTextEditorProvider {
         webview.options = { enableScripts: true, localResourceRoots: [outDir] };
         webview.html = this.html(webview.asWebviewUri(Uri.joinPath(outDir, "onboarding.js")).toString(), webview.cspSource);
 
-        let loading = false;
-        let again = false;
-        const load = async () => {
-            if (loading) {
-                again = true;
-                return;
-            }
-            loading = true;
-            try {
-                const engine = findEngine(workspaceDir);
-                if (engine === null) {
-                    await webview.postMessage({
-                        type: "error",
-                        message: `No .venv with the onboarding engine above ${workspaceDir}. Set inmanta.onboarding.python to the python that has it.`,
-                    });
-                    return;
-                }
-                const command = [engine.python, ...engine.prefix].map(quote).join(" ");
-                try {
-                    const stdout = await new Promise<string>((resolve, reject) => {
-                        execFile(engine.python, [...engine.prefix, "status", "--json"], { cwd: engine.cwd, maxBuffer: 512 * 1024 * 1024 }, (error, out, err) =>
-                            error ? reject(new Error(err.trim() || error.message)) : resolve(out),
-                        );
-                    });
-                    await webview.postMessage({ type: "load", data: JSON.parse(stdout), command, cwd: engine.cwd });
-                } catch (e) {
-                    await webview.postMessage({ type: "error", message: `${command} status --json failed:\n${e instanceof Error ? e.message : String(e)}` });
-                }
-            } finally {
-                loading = false;
-                if (again) {
-                    again = false;
-                    void load();
-                }
-            }
+        const engine = this.engine(workspaceDir);
+        const command = () => {
+            const found = findEngine(workspaceDir);
+            return found ? [found.python, ...found.prefix].map(quote).join(" ") : "onboard";
         };
-        const scheduleLoad = debounce(() => void load(), 400);
-
-        // Every command writes into the workspace: reload on any change there, but not on the raw sources
-        const watcher = workspace.createFileSystemWatcher(new RelativePattern(workspaceDir, "{onboard.yaml,candidates/**,observations/*,rules/**,sources/*/manifest.yaml}"));
-        const subscriptions: Disposable[] = [
-            watcher,
-            watcher.onDidChange(scheduleLoad),
-            watcher.onDidCreate(scheduleLoad),
-            watcher.onDidDelete(scheduleLoad),
-            webview.onDidReceiveMessage((message: WebviewMessage) => this.receive(message, workspaceDir, load)),
-        ];
-        panel.onDidDispose(() => subscriptions.forEach((s) => s.dispose()));
+        const unlisten = engine.listen((message) => {
+            switch (message.event) {
+                case "snapshot":
+                    void webview.postMessage({ type: "load", data: message.data, command: command() });
+                    return;
+                case "steps":
+                    void webview.postMessage({ type: "steps", steps: message.data });
+                    return;
+                case "activity":
+                    void webview.postMessage({ type: "activity", activity: message.data });
+                    return;
+                case "error":
+                case "stopped":
+                    void webview.postMessage({ type: "error", message: String(message.data) });
+                    return;
+            }
+        });
+        const subscription = webview.onDidReceiveMessage((message: WebviewMessage) => this.receive(message, workspaceDir, webview, engine));
+        panel.onDidDispose(() => {
+            unlisten();
+            subscription.dispose();
+        });
     }
 
-    private async receive(message: WebviewMessage, workspaceDir: string, load: () => Promise<void>): Promise<void> {
+    private engine(workspaceDir: string): EngineProcess {
+        let engine = this.engines.get(workspaceDir);
+        if (engine === undefined) {
+            engine = new EngineProcess(workspaceDir, this.output);
+            this.engines.set(workspaceDir, engine);
+        }
+        return engine;
+    }
+
+    private async receive(message: WebviewMessage, workspaceDir: string, webview: WebviewPanel["webview"], engine: EngineProcess): Promise<void> {
         switch (message.type) {
             case "ready":
             case "refresh":
-                await load();
+                engine.restart();
+                await engine.request("snapshot", {});
                 return;
-            case "run":
-                await this.run(workspaceDir, message.args);
+            case "run": {
+                if (EDITOR_COMMANDS.some(([a, b]) => message.args[0] === a && message.args[1] === b)) {
+                    await this.draft(message.args, webview, engine);
+                    return;
+                }
+                const reply = await engine.request("run", { args: message.args });
+                await webview.postMessage({ type: "reply", args: message.args, ok: reply.result?.ok ?? false, output: reply.result?.output ?? reply.error ?? "" });
                 return;
+            }
+            case "step": {
+                const reply = await engine.request("refresh", { step: message.step });
+                await webview.postMessage({ type: "reply", args: message.step.split(" "), ok: reply.result?.ok ?? false, output: reply.result?.output ?? reply.error ?? "" });
+                return;
+            }
             case "open": {
                 const uri = Uri.file(path.join(workspaceDir, message.path));
                 await window.showTextDocument(uri, { viewColumn: ViewColumn.Beside, preview: true });
@@ -189,34 +292,60 @@ class OnboardingStudioProvider implements CustomTextEditorProvider {
         }
     }
 
-    /** Type the command in the terminal of the workspace: the user sees it, its output and can rerun it */
-    private async run(workspaceDir: string, args: string[]): Promise<void> {
-        const engine = findEngine(workspaceDir);
-        if (engine === null) {
-            void window.showErrorMessage("Onboarding Studio: no python with the onboarding engine, set inmanta.onboarding.python");
+    /** Open the draft of an editor command in a tab; each save passes it to the engine, until it takes it */
+    private async draft(args: string[], webview: WebviewPanel["webview"], engine: EngineProcess): Promise<void> {
+        const made = await engine.request("run", { args: [...args, "--draft"] });
+        if (!made.result?.ok) {
+            await webview.postMessage({ type: "reply", args, ok: false, output: made.result?.output ?? made.error ?? "" });
             return;
         }
-        let terminal = this.terminals.get(workspaceDir);
-        const fresh = terminal === undefined;
-        if (terminal === undefined) {
-            const editor = workspace.getConfiguration("inmanta.onboarding").get<string>("editor");
-            terminal = window.createTerminal({
-                name: `onboard ${path.basename(workspaceDir)}`,
-                cwd: engine.cwd,
-                // `review edit` and `rules diff` open their draft here; closing the tab without saving aborts
-                env: editor ? { VISUAL: editor } : undefined,
+        await this.reopen(made.result.output.trim().split("\n").pop() ?? "", args, webview, engine);
+    }
+
+    /** Show a draft file and pass each save to the engine with `--from`, until it takes it */
+    private async reopen(file: string, args: string[], webview: WebviewPanel["webview"], engine: EngineProcess): Promise<void> {
+        this.drafts.get(file)?.();
+        const document = await workspace.openTextDocument(Uri.file(file));
+        await window.showTextDocument(document, { viewColumn: ViewColumn.Beside, preview: false });
+        await webview.postMessage({ type: "reply", args, ok: true, output: "the draft is open: save it to apply, close it without saving to abort" });
+        let refused = false;
+        const tabs = () => window.tabGroups.all.flatMap((g) => g.tabs).filter((t) => t.input instanceof TabInputText && t.input.uri.fsPath === document.uri.fsPath);
+        const saved = workspace.onDidSaveTextDocument(async (d) => {
+            if (d.uri.fsPath !== document.uri.fsPath) {
+                return;
+            }
+            const reply = await engine.request("run", { args: [...args, "--from", file] });
+            const ok = reply.result?.ok ?? false;
+            await webview.postMessage({ type: "reply", args, ok, output: reply.result?.output ?? reply.error ?? "" });
+            if (ok) {
+                stop();
+                await window.tabGroups.close(tabs());
+            }
+            // a refusal is written on top of the draft as `# error:` lines: the tab reloads it, fix and save again
+            refused = !ok;
+        });
+        const closed = window.tabGroups.onDidChangeTabs(() => {
+            if (tabs().length > 0) {
+                return;
+            }
+            stop();
+            if (!refused) {
+                fs.rmSync(file, { force: true }); // closed without saving: aborted
+                return;
+            }
+            // saved but refused: the work stays, a new draft of the same changes overwrites it
+            void window.showWarningMessage("Onboarding Studio: the draft was not taken, it is kept until the next draft.", "Reopen").then((choice) => {
+                if (choice === "Reopen") {
+                    void this.reopen(file, args, webview, engine);
+                }
             });
-            this.terminals.set(workspaceDir, terminal);
-        }
-        terminal.show(true);
-        const text = [engine.python, ...engine.prefix, ...args].map(quote).join(" ");
-        // text sent while a new shell still starts is lost, e.g. when the python extension activates a venv in it
-        const integration = terminal.shellIntegration ?? (fresh ? await shellIntegration(terminal, 5000) : undefined);
-        if (integration) {
-            integration.executeCommand(text);
-        } else {
-            terminal.sendText(text);
-        }
+        });
+        const stop = (): void => {
+            saved.dispose();
+            closed.dispose();
+            this.drafts.delete(file);
+        };
+        this.drafts.set(file, stop);
     }
 
     private html(script: string, cspSource: string): string {

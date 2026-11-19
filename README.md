@@ -17,13 +17,14 @@ For every state, the inspector previews what the web console shows: the state ba
 The `states.csv` next to the lifecycle csv is picked up automatically. What the lifecycle csv can't hold goes in files next to it, which can also be written by hand: the transfer annotations in `<name>.transfers.csv` (one row per transfer, identified by `source`, `trigger` and `target`, pass it as the `transfers_csv_file` of `future::lsm::fsm::LifecycleFactory`), the stages in display order in `<name>.stages.csv`, and the layout and scenarios, which only the studio uses, in `<name>.studio.yml`. The lifecycle checks are also reported in the Problems panel for any open lifecycle csv. The studio works without the language server.
 
 ## Onboarding Studio
-Open the `onboard.yaml` of an onboarding workspace with the **Open in Onboarding Studio** button in the editor title, or with *Open With... > Inmanta Onboarding Studio*. The studio shows what `onboard status --json` of the onboarding engine prints and reloads when the workspace changes:
+Open the `onboard.yaml` of an onboarding workspace with the **Open in Onboarding Studio** button in the editor title, or with *Open With... > Inmanta Onboarding Studio*. The studio runs `onboard serve`, the engine that keeps the workspace up to date and pushes what changed:
 
-- **Pipeline**: the candidates per stage, the sources with their latest fetch and the observation types with their counts.
+- **Pipeline**: the status of the workspace, the steps the engine runs by itself (fetch, observe, identify, ...) with when they last ran, the sources and the observation types with their counts.
 - **Candidates**: the candidates by stage, with their findings, attributes, instance and classified changes. Check several candidates for the bulk commands.
 - **Rules**: the files of the pack, to open in the editor.
+- **Activity**: every command that ran, with its output.
 
-Every action is one `onboard` command, shown on its button and typed in the terminal of the workspace, so nothing happens that you could not type yourself. A suggestion is only applied when you run `review set`. `review edit` and `rules diff` open their draft in a tab (`inmanta.onboarding.editor`, `code --wait` by default): save and close it to apply, close it without saving to abort. The engine is the first `.venv` up from the workspace, or the python of `inmanta.onboarding.python`.
+Every action is one `onboard` command as the CLI takes it, so nothing happens that you could not type yourself. A suggestion is only applied when you run `review set`. `review edit` and `rules diff` open their draft in an editor tab: save it to apply, close it without saving to abort. When the engine refuses a draft, the reason is written on top of it: fix it and save again. The engine is the first `.venv` up from the workspace, or the python of `inmanta.onboarding.python`.
 
 ## Development
 

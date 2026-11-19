@@ -38,12 +38,11 @@ button.chip { cursor: pointer; }
 .candidate-list li.on { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
 .candidate-list .who { display: grid; min-width: 0; }
 .candidate-list .who > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.candidate-list .badge { font-size: 0.8em; }
 
 /* findings */
 .findings { display: grid; gap: 6px; }
-.finding { display: grid; grid-template-columns: 84px minmax(90px, auto) minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
-.finding .badge { text-align: center; }
+.finding { display: grid; grid-template-columns: 68px minmax(90px, auto) minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.finding .badge { justify-self: start; }
 .finding:not(.open) { opacity: 0.75; }
 .finding .resolved-how { color: var(--k-deployed); }
 .set-form { grid-column: 2 / -1; display: grid; gap: 3px; }
@@ -55,8 +54,8 @@ button.chip { cursor: pointer; }
 
 /* changes */
 .changes { display: grid; gap: 4px; }
-.change { display: grid; grid-template-columns: auto 104px minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
-.change .badge { text-align: center; }
+.change { display: grid; grid-template-columns: auto 84px minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.change .badge { justify-self: start; }
 .change .pick { display: inline-flex; gap: 4px; align-items: center; }
 .change .what { min-width: 0; overflow-wrap: anywhere; }
 .diff { border-collapse: collapse; margin-top: 2px; }
@@ -76,3 +75,52 @@ details summary { cursor: pointer; }
 .set-row select { width: 100%; }
 .instance-error { margin-top: 8px; padding: 6px 8px; border-left: 3px solid var(--l-danger); }
 .instance-error pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+
+/* engine: steps, activity and the reply to an action */
+.step-chips { display: inline-flex; gap: 4px; align-items: center; margin-left: 8px; flex-wrap: wrap; }
+.table.steps pre.error { margin: 4px 0 0; white-space: pre-wrap; max-height: 160px; overflow: auto; color: var(--l-danger); }
+.activity { display: grid; gap: 2px; }
+.activity-row { display: grid; grid-template-columns: 56px 52px minmax(0, 1fr); gap: 4px 10px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.activity-row .badge { justify-self: start; }
+.activity-row pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+.activity-row code { overflow-wrap: anywhere; }
+.toast-host { position: fixed; right: 16px; bottom: 16px; max-width: min(560px, calc(100vw - 32px)); z-index: 10; }
+.toast { background: var(--vscode-editorWidget-background); border: 1px solid var(--border); border-left: 3px solid var(--l-success); padding: 6px 10px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); }
+.toast.failed { border-left-color: var(--l-danger); }
+.toast-head { display: flex; gap: 10px; justify-content: space-between; align-items: baseline; }
+.toast-head code { overflow-wrap: anywhere; }
+.toast pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; }
+.field-error { margin: 2px 0; padding: 3px 6px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--l-danger); border-left: 3px solid var(--l-danger); background: var(--vscode-inputValidation-errorBackground, transparent); }
+button.cmd.busy { opacity: 1; border-color: var(--l-info); }
+button.cmd.busy .why { color: var(--l-info); }
+
+/* Labels as in the web console: the PatternFly v6 compact label, filled, nonstatus colors (pf-v6-c-label tokens).
+   Light themes take the PatternFly fills as they are; dark themes a dark tint of the same color with light text. */
+.onboarding .badge {
+    --label-tint: #c7c7c7; --label-bg: #e0e0e0; --label-fg: #151515;
+    display: inline-flex; align-items: center; max-width: 100%;
+    padding: 0 0.5rem; border: 0; border-radius: 999px; line-height: 1.5;
+    font-family: var(--vscode-font-family); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    background: var(--label-bg); color: var(--label-fg);
+}
+.onboarding .badge.l-danger { --label-tint: #fbc5c5; --label-bg: #fbc5c5; }
+.onboarding .badge.l-warning { --label-tint: #fccb8f; --label-bg: #fccb8f; }
+.onboarding .badge.l-info { --label-tint: #b9dafc; --label-bg: #b9dafc; }
+.onboarding .badge.l-success { --label-tint: #d1f1bb; --label-bg: #d1f1bb; }
+body.vscode-dark .onboarding .badge, body.vscode-high-contrast:not(.vscode-high-contrast-light) .onboarding .badge {
+    --label-bg: color-mix(in srgb, var(--label-tint) 22%, var(--vscode-editor-background));
+    --label-fg: var(--label-tint);
+}
+.onboarding button.chip.badge { cursor: pointer; }
+
+/* actions of a table row: PatternFly plain icon buttons, muted until hovered */
+.table.attributes td.row-actions { white-space: nowrap; width: 1%; text-align: right; }
+.row-actions > * { vertical-align: middle; }
+.row-actions .badge { margin-right: 4px; }
+button.icon-button { display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; }
+button.icon-button:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+button.icon-button:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.onboarding .spinner { display: inline-flex; vertical-align: middle; margin-left: 6px; color: var(--muted); }
+.onboarding .spinner svg { width: 12px; height: 12px; animation: onboarding-spin 1.2s linear infinite; }
+@keyframes onboarding-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .onboarding .spinner svg { animation: none; } }
