@@ -1,12 +1,13 @@
 /**
- * The Onboarding Studio webview.  It shows the snapshot of `onboard status --json` and turns every action into an
- * `onboard` command that the extension types in a terminal: the studio suggests, the user decides.
+ * The Onboarding Studio webview.  It shows the snapshot `onboard serve` pushes and turns every action into an `onboard`
+ * command the engine runs: the studio suggests, the user decides.  The activity shows every command that ran.
  */
 import { add, Child, clear, h } from "../dom";
+import { faIcon } from "../icons";
 import { bindSplitter } from "../splitter";
 import css from "../studio.css";
 import onboardingCss from "./onboarding.css";
-import { Candidate, CatalogAttribute, Change, Finding, Snapshot } from "./types";
+import { Activity, Candidate, CatalogAttribute, Change, Finding, Snapshot, Step } from "./types";
 
 interface VsCodeApi {
     postMessage(message: unknown): void;
@@ -16,7 +17,7 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 const vscode = acquireVsCodeApi();
 
-type View = "pipeline" | "candidates" | "rules";
+type View = "pipeline" | "candidates" | "rules" | "activity";
 
 interface Ui {
     view: View;
@@ -41,6 +42,19 @@ const drafts = new Map<string, string>();
 /** `key|attribute` of the attribute rows with their set form open */
 const editing = new Set<string>();
 let reason = "";
+let steps: Step[] = [];
+/** The last state of each step that was not running: a background run keeps it, with a spinner, so the label does not blink */
+const settled = new Map<string, string>();
+/** The newest first, the last 200 */
+let activity: Activity[] = [];
+/** The actions sent and not answered yet */
+let running: string[] = [];
+let toast: { text: string; ok: boolean; output: string } | null = null;
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+/** The error of a set form, by its field, until the value is typed again */
+const fieldErrors = new Map<string, string>();
+/** The actions sent from a form, by their command: the form shows the error, `ok` runs when it went */
+const fromForm = new Map<string, { field: string; ok?: () => void }>();
 
 function persist(): void {
     vscode.setState(ui);
@@ -63,10 +77,11 @@ const left = h("aside", { class: "panel left" });
 const content = h("main", { class: "panel content" });
 const inspector = h("aside", { class: "panel inspector" });
 const footer = h("div", { class: "problems" });
+const toastHost = h("div", { class: "toast-host" });
 const leftSplit = h("div", { class: "splitter left-split", title: "Drag to resize, double click to reset" });
 const rightSplit = h("div", { class: "splitter right-split", title: "Drag to resize, double click to reset" });
 const main = h("div", { class: "main" }, left, content, inspector, leftSplit, rightSplit);
-app.append(toolbar, main, footer);
+app.append(toolbar, main, footer, toastHost);
 
 function applyWidths(): void {
     for (const [name, width] of [["--left-w", ui.leftWidth], ["--right-w", ui.rightWidth]] as const) {
@@ -129,18 +144,38 @@ function commandText(args: string[]): string {
     return ["onboard", ...args].map(shellArg).join(" ");
 }
 
-function run(args: string[]): void {
+function run(args: string[], form?: { field: string; ok?: () => void }): void {
+    if (form) {
+        fromForm.set(commandText(args), form);
+        fieldErrors.delete(form.field);
+    }
+    running = [...running, commandText(args)];
+    renderToast();
+    if (data && ui.view === "candidates") {
+        renderInspectorOnly();
+    }
+    renderToolbar();
     post({ type: "run", args });
+}
+
+function runStep(step: string): void {
+    running = [...running, `onboard ${step}`];
+    renderToolbar();
+    post({ type: "step", step });
 }
 
 /** A button that runs one command, with the command under its title; disabled with the reason why */
 /** `uncheck`: the checked candidates the command takes, unchecked once it runs: they move to another stage */
 function cmd(title: string, args: string[] | null, options: { why?: string | false; danger?: boolean; hint?: string; uncheck?: string[] } = {}): HTMLElement {
+    const busy = args !== null && running.includes(commandText(args));
+    if (busy) {
+        options = { ...options, why: "running..." };
+    }
     const disabled = Boolean(options.why) || args === null;
     return h("button", {
-        class: `cmd${options.danger ? " danger" : ""}`,
+        class: `cmd${options.danger ? " danger" : ""}${busy ? " busy" : ""}`,
         disabled,
-        title: options.hint ?? (args ? `Runs in the terminal: ${command} ${args.map(shellArg).join(" ")}` : undefined),
+        title: options.hint ?? (args ? `Runs: ${command} ${args.map(shellArg).join(" ")}` : undefined),
         onclick: () => args && runAndUncheck(args, options.uncheck ?? []),
     }, h("b", null, title), args ? h("code", null, `$ ${commandText(args)}`) : null, disabled && options.why ? h("span", { class: "why" }, options.why) : null);
 }
@@ -151,6 +186,11 @@ function runAndUncheck(args: string[], keys: string[]): void {
         keys.forEach((k) => checked.delete(k));
         render();
     }
+}
+
+/** A PatternFly plain button with only an icon: its label is the tooltip and what a screen reader says */
+function iconButton(icon: string, label: string, onclick: () => void, title = label): HTMLElement {
+    return h("button", { class: "icon-button", title, "aria-label": label, onclick }, faIcon(icon));
 }
 
 function openFile(file: string): void {
@@ -169,11 +209,34 @@ let rendered: { view: string; selected: string | null } | null = null;
 function render(): void {
     const same = rendered?.view === ui.view;
     const scrolls = [left, ...(same && rendered?.selected === ui.selected ? [content, inspector] : [])].map((p) => [p, p.scrollTop] as const);
+    const focus = focused();
     renderPanels();
     if (same) {
         scrolls.forEach(([p, top]) => (p.scrollTop = top));
     }
     rendered = { view: ui.view, selected: ui.selected };
+    refocus(focus);
+}
+
+/** The field being typed in, by its `data-focus`: the engine pushes changes while you type, a render must keep it */
+function focused(): { key: string; start: number | null; end: number | null } | null {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !active.dataset.focus) {
+        return null;
+    }
+    const text = active instanceof HTMLInputElement && active.type !== "checkbox" && active.type !== "number";
+    return { key: active.dataset.focus, start: text ? active.selectionStart : null, end: text ? active.selectionEnd : null };
+}
+
+function refocus(focus: ReturnType<typeof focused>): void {
+    if (focus === null) {
+        return;
+    }
+    const element = [...app.querySelectorAll<HTMLElement>("[data-focus]")].find((e) => e.dataset.focus === focus.key);
+    element?.focus({ preventScroll: true });
+    if (element instanceof HTMLInputElement && focus.start !== null) {
+        element.setSelectionRange(focus.start, focus.end);
+    }
 }
 
 function renderPanels(): void {
@@ -199,6 +262,8 @@ function renderPanels(): void {
         renderPipeline(data);
     } else if (ui.view === "rules") {
         renderRules(data);
+    } else if (ui.view === "activity") {
+        renderActivity();
     } else {
         renderCandidates(data);
     }
@@ -214,15 +279,16 @@ function renderToolbar(): void {
     add(toolbar,
         h("b", null, "Onboarding Studio"),
         data ? h("span", { class: "mono" }, data.workspace.name) : null,
-        seg<View>([["pipeline", "Pipeline"], ["candidates", "Candidates"], ["rules", "Rules"]], ui.view, (v) => {
+        seg<View>([["pipeline", "Pipeline"], ["candidates", "Candidates"], ["rules", "Rules"], ["activity", "Activity"]], ui.view, (v) => {
             ui.view = v;
             persist();
             render();
         }),
+        stepChips(),
         h("div", { class: "files" },
             orchestrator?.url ? h("span", { class: "muted", title: "orchestrator: in onboard.yaml, where apply, result and decide act" }, `${orchestrator.url} `, h("span", { class: "mono" }, orchestrator.environment ?? "")) : h("span", { class: "warning" }, "no orchestrator in onboard.yaml"),
             fileButton("onboard.yaml"),
-            h("button", { title: "Read the workspace again (status --json)", onclick: () => post({ type: "refresh" }) }, "Refresh"),
+            h("button", { title: "Ask the engine for the workspace again, and start it when it stopped", onclick: () => post({ type: "refresh" }) }, "Refresh"),
         ),
     );
 }
@@ -243,7 +309,7 @@ function renderPipeline(d: Snapshot): void {
             h("td", { class: "mono" }, s.plugin),
             h("td", { class: "mono" }, s.latest ? `sources/${s.latest}/` : h("span", { class: "warning" }, "never fetched")),
             h("td", { class: "muted" }, s.fetched_at ?? "-"),
-            h("td", null, h("button", { title: `$ ${commandText(["fetch", s.name])}`, onclick: () => run(["fetch", s.name]) }, "Fetch")),
+            h("td", null, h("button", { title: `$ ${commandText(["fetch", s.name])}`, onclick: () => runStep(`fetch ${s.name}`) }, "Fetch")),
         ))),
     );
     const observations = h("table", { class: "table" },
@@ -254,15 +320,88 @@ function renderPipeline(d: Snapshot): void {
             h("td", { class: "num" }, o.count === null ? h("span", { class: "warning" }, "not built") : String(o.count)),
         ))),
     );
-    add(content, statusSection(d),
-        section("Sources", h("p", { class: "help" }, "What onboard.yaml declares, and the latest folder of each. A fetch writes a new dated folder, a second fetch on the same day replaces it."), sources),
-        section("Observations", h("p", { class: "help" }, "Typed records from the latest sources, declared in rules/observations.yaml."), observations,
-            h("div", { class: "actions" }, cmd("Build the observations", ["observe"]))),
-        section("Candidates", h("p", { class: "help" }, "The identify rules turn observations into candidates with findings. The reviews stay."),
-            h("div", { class: "actions" }, cmd("Identify", ["identify"]), cmd("Status", ["status"]))),
-        section("Instances", h("p", { class: "help" }, "Read back the state, resources and diff of every applied candidate into result.yaml."),
-            h("div", { class: "actions" }, cmd("Read back every instance", ["result"]), cmd("Changes of every instance", ["changes"]))),
+    add(content, statusSection(d), stepsSection(),
+        section("Sources", h("p", { class: "help" }, "What onboard.yaml declares, and the latest folder of each. A source with `refresh: 15m` is fetched again on that interval; the others when you fetch them."), sources),
+        section("Observations", h("p", { class: "help" }, "Typed records from the latest sources, declared in rules/observations.yaml."), observations),
     );
+}
+
+const STEP_CLASS: Record<string, string> = { fresh: "l-success", stale: "l-warning", running: "l-info", failed: "l-danger", never: "l-none" };
+const STEP_HELP: Record<string, string> = {
+    observe: "after a fetch, or a change of rules/observations.yaml",
+    identify: "after observe, or a change of the identify rules, the functions or the catalog",
+    result: "every 30 s while there are applied candidates, every 3 s for a minute after apply or decide",
+};
+
+function ago(at: string | null): string {
+    if (!at) {
+        return "never";
+    }
+    const seconds = Math.round((Date.now() - Date.parse(at)) / 1000);
+    return seconds < 0 ? `in ${Math.round(-seconds / 60) || 1} min` : seconds < 90 ? `${seconds} s ago` : seconds < 5400 ? `${Math.round(seconds / 60)} min ago` : at.replace("T", " ").replace("+00:00", " UTC");
+}
+
+/** The steps that are not fresh, in the toolbar: what the engine is doing or what needs attention */
+function stepChips(): HTMLElement {
+    const busy = running.length ? h("span", { class: "chip l-info", title: running.join("\n") }, `running ${running.length === 1 ? running[0] : `${running.length} commands`}`) : null;
+    const notable = steps.map((s) => ({ ...s, state: stepState(s) })).filter((s) => s.state !== "fresh" && s.state !== "never");
+    return h("div", { class: "chips step-chips" }, busy,
+        notable.map((s) => h("button", { class: `chip badge ${STEP_CLASS[s.state]}`, title: s.error ?? `${s.command}: ${s.state}`, onclick: () => {
+            ui.view = s.state === "failed" ? "activity" : "pipeline";
+            persist();
+            render();
+        } }, `${s.name} ${s.state}`)),
+        !busy && !notable.length && steps.length ? h("span", { class: "muted small", title: steps.map((s) => `${s.name}: ${ago(s.last_run)}`).join("\n") }, "up to date") : null);
+}
+
+/** The state to show: a running step keeps the state it had */
+function stepState(s: Step): string {
+    return s.state === "running" ? settled.get(s.name) ?? "running" : s.state;
+}
+
+function stepsSection(): HTMLElement {
+    const table = h("table", { class: "table steps" },
+        h("thead", null, h("tr", null, ["Step", "State", "Last run", "Next run", "Runs", ""].map((t) => h("th", null, t)))),
+        h("tbody", null, steps.map((s) => h("tr", null,
+            h("td", { class: "mono" }, s.command),
+            h("td", null, badge(stepState(s), STEP_CLASS[stepState(s)]),
+                s.state === "running" ? h("span", { class: "spinner", title: "running", "aria-label": "running" }, faIcon("FaSyncAlt")) : null,
+                s.error ? h("pre", { class: "mono small error" }, s.error) : null),
+            h("td", { class: "muted" }, ago(s.last_run)),
+            h("td", { class: "muted" }, s.next_run ? ago(s.next_run) : "-"),
+            h("td", { class: "small muted" }, s.name.startsWith("fetch ") ? (s.next_run ? "on its refresh interval" : "on request") : STEP_HELP[s.name] ?? ""),
+            h("td", null, h("button", { disabled: s.state === "running", title: `$ ${s.command}`, onclick: () => runStep(s.name) }, "Run now")),
+        ))));
+    const el = section("Steps", h("p", { class: "help" }, "The engine keeps these up to date by itself: a step runs when its input changed or its interval passed. Run now does not wait."), table);
+    el.dataset.section = "steps";
+    return el;
+}
+
+// ---------- activity ----------
+
+function renderActivity(): void {
+    add(content, section("Activity", h("p", { class: "help" }, "Every command the engine ran, the newest first: your actions and the background steps. Each is a command you can type yourself."),
+        activity.length ? h("div", { class: "activity" }, activity.map((a) => h("div", { class: `activity-row${a.ok ? "" : " failed"}` },
+            h("span", { class: "muted small" }, a.at.slice(11, 19)),
+            badge(a.ok ? (a.kind === "step" ? "step" : "done") : "failed", a.ok ? (a.kind === "step" ? "l-none" : "l-success") : "l-danger"),
+            h("div", null, h("code", null, `$ ${a.command}`),
+                a.output ? (a.output.split("\n").length > 3 || a.output.length > 300
+                    ? h("details", { open: !a.ok }, h("summary", { class: "small muted" }, `${a.output.split("\n").length} lines`), h("pre", { class: "mono small" }, a.output))
+                    : h("pre", { class: "mono small" }, a.output)) : null),
+        ))) : h("p", { class: "muted" }, "Nothing ran yet.")));
+}
+
+function renderToast(): void {
+    clear(toastHost);
+    if (toast === null) {
+        return;
+    }
+    add(toastHost, h("div", { class: `toast${toast.ok ? "" : " failed"}` },
+        h("div", { class: "toast-head" }, h("code", null, toast.text), h("button", { class: "link", onclick: () => {
+            toast = null;
+            renderToast();
+        } }, "close")),
+        toast.output ? h("pre", { class: "mono small" }, toast.output.split("\n").slice(0, 12).join("\n")) : null));
 }
 
 function statusSection(d: Snapshot): HTMLElement {
@@ -311,6 +450,8 @@ function renderRules(d: Snapshot): void {
 // ---------- candidates ----------
 
 /** The candidates of the entity that match the search, in every stage: what the stage chips count */
+const NATURAL = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
 function found(d: Snapshot): Candidate[] {
     const search = ui.search.toLowerCase();
     return d.candidates.filter((c) =>
@@ -332,7 +473,7 @@ function openCounts(c: Candidate): string {
 function renderCandidates(d: Snapshot): void {
     const entities = [...new Set(d.candidates.map((c) => c.entity))].sort();
     const selected = d.candidates.find((c) => c.key === ui.selected) ?? null;
-    const search = h("input", { type: "search", placeholder: "Find a key or an open finding", value: ui.search });
+    const search = h("input", { type: "search", placeholder: "Find a key or an open finding", value: ui.search, "data-focus": "search" });
     search.addEventListener("input", () => {
         ui.search = search.value;
         renderList();
@@ -445,22 +586,11 @@ function findingRow(c: Candidate, f: Finding, editable: boolean): HTMLElement {
     if (!editable || f.state !== "open" || f.level === "blocker") {
         return row;
     }
-    const draftKey = `${c.key}|${f.attribute}`;
-    const initial = drafts.get(draftKey) ?? (f.suggestion !== null && f.suggestion !== undefined ? yamlValue(f.suggestion) : "");
-    const input = h("input", { class: "mono", value: initial, placeholder: "value, as yaml: rocky9, [web, db], true" });
-    const code = h("code", { class: "small" });
-    const button = h("button", { onclick: () => input.value.trim() && run(["review", "set", c.key, `${f.attribute}=${input.value.trim()}`]) }, "Set");
-    const update = () => {
-        drafts.set(draftKey, input.value);
-        code.textContent = `$ ${commandText(["review", "set", c.key, `${f.attribute}=${input.value.trim() || "<value>"}`])}`;
-        (button as HTMLButtonElement).disabled = !input.value.trim();
-    };
-    input.addEventListener("input", update);
-    input.addEventListener("keydown", (e) => e.key === "Enter" && button.click());
-    update();
-    add(row, h("div", { class: "set-form" },
-        f.suggestion !== null && f.suggestion !== undefined ? h("span", { class: "small muted" }, "suggestion, not applied until you set it") : null,
-        h("div", { class: "set-row" }, input, button), code));
+    const suggested = f.suggestion !== null && f.suggestion !== undefined;
+    add(row, setForm({
+        field: `finding|${c.key}|${f.attribute}`, keys: [c.key], attribute: f.attribute, type: data?.catalog?.[c.entity]?.[f.attribute],
+        current: suggested ? f.suggestion : undefined, note: suggested ? "suggestion, not applied until you set it" : undefined,
+    }));
     return row;
 }
 
@@ -478,32 +608,52 @@ function attributesSection(c: Candidate): HTMLElement {
         const row = h("tr", { class: set ? "set" : "" },
             h("td", { class: "mono" }, k),
             h("td", null, value),
-            h("td", null,
-                set ? h("span", { class: "small" }, "set in review ") : null,
-                canClear && set ? h("button", { class: "link", title: `$ ${commandText(["review", "clear", c.key, k])}`, onclick: () => run(["review", "clear", c.key, k]) }, "clear") : null,
-                canClear ? h("button", { class: "link", title: "Set another value in review", onclick: toggle }, editing.has(editKey) ? "cancel" : "change") : null),
+            h("td", { class: "row-actions" },
+                set ? badge("set in review", "l-info") : null,
+                canClear && set ? iconButton("FaUndoAlt", `Clear ${k}: back to what the rules found`, () => run(["review", "clear", c.key, k]), `Back to what the rules found\n$ ${commandText(["review", "clear", c.key, k])}`) : null,
+                canClear ? iconButton("FaPencilAlt", editing.has(editKey) ? `Stop changing ${k}` : `Change ${k}`, toggle, editing.has(editKey) ? "Cancel" : "Set another value in review") : null),
         );
-        return canClear && editing.has(editKey) ? [row, h("tr", { class: "edit" }, h("td"), h("td", { colspan: "2" }, attributeForm(c, k, v)))] : [row];
+        const form = () => setForm({ field: `attribute|${editKey}`, keys: [c.key], attribute: k, type: data?.catalog?.[c.entity]?.[k], current: v, ok: () => editing.delete(editKey) });
+        return canClear && editing.has(editKey) ? [row, h("tr", { class: "edit" }, h("td"), h("td", { colspan: "2" }, form()))] : [row];
     });
     return section("Attributes, what apply sends", h("table", { class: "table attributes" }, h("tbody", null, rows)));
 }
 
-/** `review set` for any attribute, also one the rules found: the value set in review overrides it */
-function attributeForm(c: Candidate, attribute: string, current: unknown): HTMLElement {
-    const draftKey = `${c.key}|${attribute}`;
-    const input = valueInput(data?.catalog?.[c.entity]?.[attribute], current, drafts.get(draftKey));
+/** `review set` of one attribute on one or more candidates: an input for its catalog type, the command, its error */
+function setForm(o: {
+    field: string; keys: string[]; attribute: string; type: CatalogAttribute | undefined; current: unknown; note?: string; ok?: () => void;
+}): HTMLElement {
+    const input = valueInput(o.type, o.current, drafts.get(o.field));
+    input.element.dataset.focus = o.field;
     const code = h("code", { class: "small" });
-    const button = h("button", { onclick: () => input.value() !== null && (editing.delete(draftKey), run(["review", "set", c.key, `${attribute}=${input.value()}`])) }, "Set");
+    const error = fieldErrors.get(o.field);
+    const errorLine = error ? h("pre", { class: "field-error mono small" }, error) : null;
+    const args = (value: string) => ["review", "set", ...o.keys, `${o.attribute}=${value}`];
+    const button = h("button", { onclick: () => {
+        const value = input.value();
+        if (value !== null) {
+            run(args(value), { field: o.field, ok: o.ok });
+        }
+    } }, "Set") as HTMLButtonElement;
     const update = () => {
-        drafts.set(draftKey, input.draft());
-        code.textContent = `$ ${commandText(["review", "set", c.key, `${attribute}=${input.value() ?? "<value>"}`])}`;
-        (button as HTMLButtonElement).disabled = input.value() === null;
+        drafts.set(o.field, input.draft());
+        const assignment = `${o.attribute}=${input.value() ?? "<value>"}`;
+        code.textContent = o.keys.length > 2
+            ? `$ ${commandText(["review", "set", o.keys[0]])} ...${o.keys.length - 1} more ${shellArg(assignment)}`
+            : `$ ${commandText(["review", "set", ...o.keys, assignment])}`;
+        button.disabled = input.value() === null;
     };
-    input.element.addEventListener("input", update);
-    input.element.addEventListener("change", update);
+    const typed = () => {
+        update();
+        if (fieldErrors.delete(o.field)) {
+            errorLine?.remove();
+        }
+    };
+    input.element.addEventListener("input", typed);
+    input.element.addEventListener("change", typed);
     input.element.addEventListener("keydown", (e) => e.key === "Enter" && button.click());
     update();
-    return h("div", { class: "set-form" }, h("div", { class: "set-row" }, input.element, button), code);
+    return h("div", { class: "set-form" }, o.note ? h("span", { class: "small muted" }, o.note) : null, h("div", { class: "set-row" }, input.element, button), errorLine, code);
 }
 
 /** An input for the catalog type of an attribute; `value()` is the yaml `review set` takes, null while there is none */
@@ -516,9 +666,10 @@ interface ValueInput {
 function valueInput(type: CatalogAttribute | undefined, current: unknown, draft: string | undefined): ValueInput {
     const base = type?.type.replace(/\?$/, "") ?? "";
     const nullable = type?.type.endsWith("?") ?? false;
-    const initial = draft ?? yamlValue(current);
+    const initial = draft ?? (current === undefined ? "" : yamlValue(current));
     const choice = (options: string[]): ValueInput => {
-        const select = h("select", { class: "mono" }, [...options, ...(nullable ? ["null"] : [])].map((o) => h("option", { value: o }, o))) as HTMLSelectElement;
+        const select = h("select", { class: "mono" }, h("option", { value: "", disabled: true }, "choose a value"),
+            [...options, ...(nullable ? ["null"] : [])].map((o) => h("option", { value: o }, o))) as HTMLSelectElement;
         select.value = select.querySelector(`option[value="${CSS.escape(initial)}"]`) ? initial : "";
         return { element: select, value: () => select.value || null, draft: () => select.value };
     };
@@ -540,6 +691,19 @@ function valueInput(type: CatalogAttribute | undefined, current: unknown, draft:
         const element = h("div", { class: "enum-list" }, type.values.map((v, i) => h("label", { class: "mono small" }, boxes[i], ` ${v}`)));
         const list = () => JSON.stringify(boxes.filter((b) => b.checked).map((b) => b.value));
         return { element, value: list, draft: list };
+    }
+    if (base === "string[]") {
+        // one value after the other, separated by commas; `[...]` is taken as yaml, for a value with a comma
+        const listed = Array.isArray(current) ? current.map(String).join(", ") : typeof current === "string" ? current : "";
+        const text = h("input", { class: "mono", value: draft ?? listed, placeholder: "/root, /home: separated by commas" }) as HTMLInputElement;
+        const list = () => {
+            const value = text.value.trim();
+            if (value.startsWith("[")) {
+                return value;
+            }
+            return value || nullable ? JSON.stringify(value.split(",").map((v) => v.trim()).filter(Boolean)) : null;
+        };
+        return { element: text, value: list, draft: () => text.value };
     }
     if (base === "int" || base === "float") {
         const number = h("input", { class: "mono", type: "number", step: base === "int" ? "1" : "any", value: initial === "null" ? "" : initial }) as HTMLInputElement;
@@ -651,7 +815,7 @@ function changeRow(x: Change): HTMLElement {
 // ---------- actions ----------
 
 function reasonInput(): HTMLInputElement {
-    const input = h("input", { value: reason, placeholder: "why, kept in review.yaml or decision.yaml" });
+    const input = h("input", { value: reason, placeholder: "why, kept in review.yaml or decision.yaml", "data-focus": "reason" });
     input.addEventListener("input", () => {
         reason = input.value;
         renderInspectorOnly();
@@ -661,8 +825,7 @@ function reasonInput(): HTMLInputElement {
 
 /** Re-render the inspector without losing the focus of the reason field */
 function renderInspectorOnly(): void {
-    const active = document.activeElement;
-    const position = active instanceof HTMLInputElement ? active.selectionStart : null;
+    const focus = focused();
     clear(inspector);
     const d = data!;
     const selected = d.candidates.find((c) => c.key === ui.selected) ?? null;
@@ -671,11 +834,7 @@ function renderInspectorOnly(): void {
     } else if (selected) {
         renderActions(selected);
     }
-    const field = inspector.querySelector<HTMLInputElement>("input.reason");
-    if (field && active instanceof HTMLInputElement && active.classList.contains("reason")) {
-        field.focus();
-        field.setSelectionRange(position, position);
-    }
+    refocus(focus);
 }
 
 function reasonField(): HTMLElement {
@@ -697,7 +856,7 @@ function renderActions(c: Candidate): void {
                     conflictsOnly
                         ? cmd("Accept, conflicts as they are", ["review", "accept", c.key, "--accept-conflicts"])
                         : cmd("Accept", ["review", "accept", c.key], { why: blockers.length ? `${blockers.length} blocker(s) open: no review clears a blocker, fix the source or the rule` : inputs.length ? `${inputs.length} input(s) open: set them first` : false }),
-                    cmd("Edit the values in an editor", ["review", "edit", c.key], { hint: "A draft with a line per open finding opens in a tab; save and close to set, close without saving to abort" }),
+                    cmd("Edit the values in an editor", ["review", "edit", c.key], { hint: "A draft with a line per open finding opens in a tab; save it to set, close it without saving to abort" }),
                     cmd("Trace the rules", ["identify", "--trace", c.key]),
                 ),
                 reasonField(),
@@ -709,7 +868,7 @@ function renderActions(c: Candidate): void {
         }
         if (c.review.status === "accepted") {
             add(inspector, section("Apply",
-                h("p", { class: "help" }, "Creates the instance in an onboarding state with an id derived from entity and key. The first deploy only reports."),
+                h("p", { class: "help" }, "Creates the instance with an id derived from entity and key, a new one when it was deleted before: in the onboarding state of its lifecycle, where the first deploy only reports, or, when the lifecycle has none, in its initial state, which deploys."),
                 h("div", { class: "actions column" },
                     cmd("Write the request", ["apply", c.key], { hint: "Writes request.json, talks to no orchestrator" }),
                     cmd("Create the instance", ["apply", c.key, "--execute"]),
@@ -722,12 +881,17 @@ function renderActions(c: Candidate): void {
     const onboarding = !FLOW.includes(c.stage);
     const numbers = [...picked].sort((a, b) => a - b).map(String);
     const unpicked = notSafe.filter((x) => !picked.has(x.number));
+    if (c.stage === "deleted" && c.review.status === "accepted") {
+        add(inspector, section("Apply again",
+            h("p", { class: "help" }, "The orchestrator keeps the deleted instance under its id: this creates a new instance, with a new id, from the reviewed values."),
+            h("div", { class: "actions column" }, cmd("Create a new instance", ["apply", c.key, "--execute"]))));
+    }
     add(inspector,
         section("Instance",
             h("div", { class: "actions column" },
                 cmd("Read it back", ["result"], { hint: "Reads back every applied candidate: state, resources and diff into result.yaml" }),
                 cmd("Show the changes", ["changes", c.key]),
-                cmd("Write a diff rule for the picked changes", numbers.length ? ["rules", "diff", c.key, ...numbers] : null, { why: !numbers.length && "pick changes in the list first" }),
+                cmd("Write a diff rule for the picked changes", numbers.length ? ["rules", "diff", c.key, ...numbers] : null, { why: !numbers.length && "pick changes in the list first", hint: "The draft opens in a tab; save it to write the rule, close it without saving to abort" }),
             )),
         section("Decide",
             h("div", { class: "actions column" },
@@ -751,13 +915,13 @@ function renderActions(c: Candidate): void {
 
 /** One form per attribute with open findings among the checked candidates: `review set` on all of them at once */
 function bulkSet(candidates: Candidate[]): HTMLElement | null {
-    const byAttribute = new Map<string, { keys: string[]; suggestions: Set<string> }>();
+    const byAttribute = new Map<string, { keys: string[]; suggestions: Map<string, unknown> }>();
     for (const c of candidates.filter((x) => x.review.status === "open" && x.result === null)) {
         for (const f of c.findings.filter((x) => x.state === "open" && x.level !== "blocker")) {
-            const entry = byAttribute.get(f.attribute) ?? { keys: [], suggestions: new Set<string>() };
+            const entry = byAttribute.get(f.attribute) ?? { keys: [], suggestions: new Map<string, unknown>() };
             entry.keys.push(c.key);
             if (f.suggestion !== null && f.suggestion !== undefined) {
-                entry.suggestions.add(yamlValue(f.suggestion));
+                entry.suggestions.set(yamlValue(f.suggestion), f.suggestion);
             }
             byAttribute.set(f.attribute, entry);
         }
@@ -766,27 +930,14 @@ function bulkSet(candidates: Candidate[]): HTMLElement | null {
         return null;
     }
     return h("div", { class: "bulk-set" }, [...byAttribute].sort(([a], [b]) => a.localeCompare(b)).map(([attribute, { keys, suggestions }]) => {
-        const draftKey = `*|${attribute}`;
-        const common = suggestions.size === 1 ? [...suggestions][0] : "";
-        const input = h("input", { class: "mono", value: drafts.get(draftKey) ?? common, placeholder: "value, as yaml" });
-        const code = h("code", { class: "small" });
-        const args = () => ["review", "set", ...keys, `${attribute}=${input.value.trim()}`];
-        const button = h("button", { onclick: () => input.value.trim() && runAndUncheck(args(), keys) }, "Set");
-        const update = () => {
-            drafts.set(draftKey, input.value);
-            const assignment = `${attribute}=${input.value.trim() || "<value>"}`;
-            code.textContent = keys.length > 2
-                ? `$ ${commandText(["review", "set", keys[0]])} ...${keys.length - 1} more ${shellArg(assignment)}`
-                : `$ ${commandText(["review", "set", ...keys, assignment])}`;
-            (button as HTMLButtonElement).disabled = !input.value.trim();
-        };
-        input.addEventListener("input", update);
-        input.addEventListener("keydown", (e) => e.key === "Enter" && button.click());
-        update();
+        const entity = candidates.find((c) => c.key === keys[0])?.entity ?? "";
         return h("div", { class: "field" },
             h("label", null, `Set ${attribute} on ${keys.length} with it open`,
                 suggestions.size > 1 ? h("span", { class: "small muted" }, ` - ${suggestions.size} different suggestions`) : null),
-            h("div", { class: "set-row" }, input, button), code);
+            setForm({ field: `bulk|${attribute}`, keys, attribute, type: data?.catalog?.[entity]?.[attribute], current: suggestions.size === 1 ? [...suggestions.values()][0] : undefined, ok: () => {
+                keys.forEach((k) => checked.delete(k));
+                render();
+            } }));
     }));
 }
 
@@ -794,7 +945,7 @@ function renderBulk(candidates: Candidate[]): void {
     const keys = candidates.map((c) => c.key);
     const by = (test: (c: Candidate) => boolean) => candidates.filter(test).map((c) => c.key);
     const ready = by((c) => c.review.status === "open" && c.result === null && c.outcome === "ready");
-    const accepted = by((c) => c.review.status === "accepted" && c.result === null);
+    const accepted = by((c) => c.review.status === "accepted" && (c.result === null || c.stage === "deleted"));
     const safe = by((c) => c.result !== null && !FLOW.includes(c.stage) && (c.changes ?? []).every((x) => x.class === "safe"));
     const open = by((c) => c.review.status === "open" && c.result === null);
     add(inspector,
@@ -802,7 +953,7 @@ function renderBulk(candidates: Candidate[]): void {
             h("p", { class: "help" }, "Each command gets only the checked candidates it applies to."),
             h("div", { class: "actions column" },
                 cmd(`Accept ${ready.length} ready`, ready.length ? ["review", "accept", ...ready] : null, { why: !ready.length && "none is ready", uncheck: ready }),
-                cmd(`Create ${accepted.length} instance(s)`, accepted.length ? ["apply", ...accepted, "--execute"] : null, { why: !accepted.length && "none is accepted and not applied", uncheck: accepted }),
+                cmd(`Create ${accepted.length} instance(s)`, accepted.length ? ["apply", ...accepted, "--execute"] : null, { why: !accepted.length && "none is accepted and not applied, or deleted", uncheck: accepted }),
                 cmd(`Enforce ${safe.length} with only safe changes`, safe.length ? ["decide", "enforce", ...safe] : null, { why: !safe.length && "none is onboarding with only safe changes", uncheck: safe }),
             ),
             bulkSet(candidates),
@@ -821,9 +972,63 @@ function renderBulk(candidates: Candidate[]): void {
 // ---------- messages ----------
 
 window.addEventListener("message", (event: MessageEvent) => {
-    const message = event.data as { type: "load"; data: Snapshot; command: string } | { type: "error"; message: string };
+    const message = event.data as
+        | { type: "load"; data: Snapshot; command: string }
+        | { type: "error"; message: string }
+        | { type: "steps"; steps: Step[] }
+        | { type: "activity"; activity: Activity }
+        | { type: "reply"; args: string[]; ok: boolean; output: string };
+    if (message.type === "steps") {
+        steps = message.steps;
+        steps.filter((s) => s.state !== "running").forEach((s) => settled.set(s.name, s.state));
+        // only the parts that show steps, in place: a full render every few seconds blinks
+        const chips = toolbar.querySelector(".step-chips");
+        chips?.replaceWith(stepChips());
+        content.querySelector('[data-section="steps"]')?.replaceWith(stepsSection());
+        return;
+    }
+    if (message.type === "activity") {
+        activity = [message.activity, ...activity].slice(0, 200);
+        if (ui.view === "activity") {
+            render();
+        }
+        return;
+    }
+    if (message.type === "reply") {
+        const text = commandText(message.args);
+        const index = running.findIndex((r) => r === text || r === `onboard ${message.args.join(" ")}`);
+        running = running.filter((_, i) => i !== index);
+        const form = fromForm.get(text);
+        fromForm.delete(text);
+        if (form && !message.ok) {
+            // the form shows it, next to the value
+            fieldErrors.set(form.field, message.output.replace(/^refused by the catalog:\s*/, ""));
+            render();
+            return;
+        }
+        if (form?.ok) {
+            form.ok();
+            render();
+        }
+        toast = { text: `${message.ok ? "done" : "failed"}: ${text}`, ok: message.ok, output: message.output };
+        clearTimeout(toastTimer);
+        if (message.ok) {
+            toastTimer = setTimeout(() => {
+                toast = null;
+                renderToast();
+            }, 5000);
+        }
+        renderToast();
+        renderToolbar();
+        if (data && ui.view === "candidates") {
+            renderInspectorOnly();
+        }
+        return;
+    }
     if (message.type === "load") {
         data = message.data;
+        // node3 before node11: numbers in a key sort by value
+        data.candidates.sort((a, b) => a.entity.localeCompare(b.entity) || NATURAL.compare(a.key, b.key));
         command = message.command;
         error = null;
         const keys = new Set(data.candidates.map((c) => c.key));

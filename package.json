@@ -42,12 +42,6 @@
                     "default": "",
                     "description": "The python of the onboarding engine for the Onboarding Studio. Empty: the first .venv found up from the workspace that holds onboard.yaml.",
                     "scope": "resource"
-                },
-                "inmanta.onboarding.editor": {
-                    "type": "string",
-                    "default": "code --wait",
-                    "description": "VISUAL in the terminal of the Onboarding Studio: where `onboard review edit` and `onboard rules diff` open their draft. Empty keeps the editor of the shell.",
-                    "scope": "resource"
                 }
             }
         },
