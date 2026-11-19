@@ -2,6 +2,10 @@
 
 Visual editors for Inmanta projects. Installing Inmanta Studio also installs the [Inmanta extension](https://marketplace.visualstudio.com/items?itemName=Inmanta.inmanta) for the language support. The studios themselves don't need the language server or the Python extension.
 
+## Installation
+
+Inmanta Studio is not on the VS Code marketplace. Download `inmanta-studio-<version>.vsix` from the artifacts of the latest CI build of `master`, then run *Extensions: Install from VSIX...* in VS Code, or `code --install-extension inmanta-studio-<version>.vsix`. This also installs the Inmanta extension from the marketplace.
+
 ## Lifecycle Studio
 Open a csv lifecycle of `future::lsm::fsm` (a `lifecycle.csv` with `name`, `desired_state` and `on_*` columns) with the **Open in Lifecycle Studio** button in the editor title, or with *Open With... > Inmanta Lifecycle Studio*. The studio has three modes:
 
